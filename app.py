@@ -1,108 +1,117 @@
+import os
 import gradio as gr
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import CharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
-from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from google import genai
 
-model = SentenceTransformer(
-    "all-MiniLM-L6-v2",
-    cache_folder="./models"
-)
-db = None
-chat_history = []
+print("step 1: imports done")
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+load_dotenv()
+print("step 2: dotenv loaded")
 
-llm = ChatOllama(
-    model="phi",
-    temperature=0.3
-)
+API_KEY = os.getenv("GEMINI_API_KEY")
+print("step 3: api key check")
 
-def process_pdf(file):
-    global db, chat_history
+if not API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable not found.")
 
-    if file is None:
-        return "Please upload a PDF first."
+client = genai.Client(api_key=API_KEY)
+print("step 4: gemini client created")
 
-    loader = PyPDFLoader(file.name)
-    documents = loader.load()
+MODEL_NAME = "gemini-2.5-flash"
 
-    if not documents:
-        return "No content found in PDF."
 
-    splitter = CharacterTextSplitter(chunk_size=400, chunk_overlap=100)
-    docs = splitter.split_documents(documents)
+def answer_from_pdf(pdf_file, question, chat_history):
+    if chat_history is None:
+        chat_history = []
 
-    if not docs:
-        return "No readable text found in PDF."
+    if not question.strip():
+        return chat_history, chat_history, ""
 
-    db = FAISS.from_documents(docs, embeddings)
-    chat_history = []
+    if pdf_file is None:
+        chat_history.append({
+            "role": "user",
+            "content": question
+        })
+        chat_history.append({
+            "role": "assistant",
+            "content": "Please upload a PDF first."
+        })
+        return chat_history, chat_history, ""
 
-    return "PDF processed successfully."
+    try:
+        uploaded_file = client.files.upload(file=pdf_file.name)
 
-def ask_question(query):
-    global db, chat_history
+        prompt = f"""
+You are a helpful PDF question-answering assistant.
 
-    if db is None:
-        return "Please upload and process a PDF first."
+Answer the user's question only from the uploaded PDF.
+If the answer is not available in the PDF, say:
+I could not find that in the uploaded PDF.
 
-    if not query.strip():
-        return "Please enter a question."
-
-    docs = db.similarity_search(query, k=2)
-    context = "\n\n".join(doc.page_content for doc in docs)
-
-    prompt = f"""
-You are an AI assistant.
-
-Answer the question using the context below.
-If partial information is available, try to answer based on that.
-
-Only say "I could not find the answer" if absolutely nothing relevant is present.
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer in simple and clear language:
+User question:
+{question}
 """
 
-    response = llm.invoke(prompt)
-    answer = response.content
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[uploaded_file, prompt]
+        )
 
-    chat_history.append((query, answer))
-    return answer
+        answer = response.text if response.text else "No response generated."
 
-def handle_question(query):
-    response = ask_question(query)
-    return response, ""
+    except Exception as e:
+        answer = f"Error: {str(e)}"
+
+    chat_history.append({
+        "role": "user",
+        "content": question
+    })
+    chat_history.append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    return chat_history, chat_history, ""
+
 
 def reset_chat():
-    global chat_history
-    chat_history = []
-    return "", ""
+    return [], [], "", None
 
-with gr.Blocks() as app:
-    gr.Markdown("# Shimanshu's AI PDF Chatbot (LLM + RAG)")
 
-    file = gr.File(label="Upload PDF", file_types=[".pdf"])
-    process_btn = gr.Button("Process PDF")
-    status = gr.Textbox(label="Status")
+with gr.Blocks(title="AI PDF Chatbot using Gemini") as app:
+    gr.Markdown("# AI PDF Chatbot using Gemini + PDF")
+    gr.Markdown("Upload a PDF and ask questions from it.")
 
-    q = gr.Textbox(label="Ask Question", placeholder="Type your question and press Enter")
-    ans = gr.Textbox(label="Answer", lines=12)
+    pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"])
+    chatbot = gr.Chatbot(label="Chat")
+    question_box = gr.Textbox(
+        label="Ask a question from the PDF",
+        placeholder="Type your question here..."
+    )
 
-    reset_btn = gr.Button("Reset Chat")
+    with gr.Row():
+        ask_button = gr.Button("Ask")
+        reset_button = gr.Button("Reset")
 
-    process_btn.click(process_pdf, inputs=file, outputs=status)
-    q.submit(handle_question, inputs=q, outputs=[ans, q])
-    reset_btn.click(reset_chat, inputs=[], outputs=[q, ans])
+    state = gr.State([])
 
-app.launch(share=True)
+    ask_button.click(
+        fn=answer_from_pdf,
+        inputs=[pdf_input, question_box, state],
+        outputs=[chatbot, state, question_box]
+    )
+
+    question_box.submit(
+        fn=answer_from_pdf,
+        inputs=[pdf_input, question_box, state],
+        outputs=[chatbot, state, question_box]
+    )
+
+    reset_button.click(
+        fn=reset_chat,
+        inputs=[],
+        outputs=[chatbot, state, question_box, pdf_input]
+    )
+
+if __name__ == "__main__":
+    app.launch()
